@@ -18,14 +18,21 @@ package create
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"runtime"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"k8s.io/klog"
+
+	"go.opentelemetry.io/otel/api/trace"
+	"go.opentelemetry.io/otel/exporters/trace/jaeger"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -61,6 +68,8 @@ type CreateOptions struct {
 
 	Recorder genericclioptions.Recorder
 	PrintObj func(obj kruntime.Object) error
+
+	JaegerEndpoint string
 
 	genericclioptions.IOStreams
 }
@@ -130,6 +139,8 @@ func NewCmdCreate(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *cob
 	cmdutil.AddDryRunFlag(cmd)
 	cmd.Flags().StringVarP(&o.Selector, "selector", "l", o.Selector, "Selector (label query) to filter on, supports '=', '==', and '!='.(e.g. -l key1=value1,key2=value2)")
 	cmd.Flags().StringVar(&o.Raw, "raw", o.Raw, "Raw URI to POST to the server.  Uses the transport specified by the kubeconfig file.")
+
+	cmd.Flags().StringVar(&o.JaegerEndpoint, "jaeger-endpoint", o.JaegerEndpoint, "Endpoint for the jaeger collector for traces")
 
 	o.PrintFlags.AddFlags(cmd)
 
@@ -222,6 +233,19 @@ func (o *CreateOptions) Complete(f cmdutil.Factory, cmd *cobra.Command) error {
 
 // RunCreate performs the creation
 func (o *CreateOptions) RunCreate(f cmdutil.Factory, cmd *cobra.Command) error {
+	provider, flush, err := jaeger.NewExportPipeline(
+		jaeger.WithCollectorEndpoint(o.JaegerEndpoint),
+		jaeger.WithProcess(jaeger.Process{
+			ServiceName: "oc",
+		}),
+		jaeger.RegisterAsGlobal(),
+		jaeger.WithSDK(&sdktrace.Config{DefaultSampler: sdktrace.AlwaysSample()}),
+	)
+	if err != nil {
+		return err
+	}
+	defer flush()
+
 	// raw only makes sense for a single file resource multiple objects aren't likely to do what you want.
 	// the validator enforces this, so
 	if len(o.Raw) > 0 {
@@ -267,6 +291,24 @@ func (o *CreateOptions) RunCreate(f cmdutil.Factory, cmd *cobra.Command) error {
 		if err := util.CreateOrUpdateAnnotation(cmdutil.GetFlagBool(cmd, cmdutil.ApplyAnnotationsFlag), info.Object, scheme.DefaultJSONEncoder()); err != nil {
 			return cmdutil.AddSourceToErr("creating", info.Source, err)
 		}
+
+		ctx := context.Background()
+		ctx, span := provider.Tracer("oc").Start(ctx, "Create object")
+		defer span.End()
+		reqHeader := http.Header{}
+		propagator := trace.DefaultHTTPPropagator()
+		propagator.Inject(ctx, reqHeader)
+		bytes, _ := json.Marshal(reqHeader)
+		bytesEnc := base64.StdEncoding.EncodeToString(bytes)
+		annots, err := meta.NewAccessor().Annotations(info.Object)
+		if err != nil {
+			return err
+		}
+		if annots == nil {
+			annots = map[string]string{}
+		}
+		annots["trace.kubernetes.io/context"] = bytesEnc
+		meta.NewAccessor().SetAnnotations(info.Object, annots)
 
 		if err := o.Recorder.Record(info.Object); err != nil {
 			klog.V(4).Infof("error recording current command: %v", err)
