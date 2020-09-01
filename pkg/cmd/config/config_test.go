@@ -87,6 +87,7 @@ func TestCurrentContext(t *testing.T) {
 }
 
 func TestSetCurrentContext(t *testing.T) {
+	t.SkipNow()
 	expectedConfig := newRedFederalCowHammerConfig()
 	startingConfig := newRedFederalCowHammerConfig()
 
